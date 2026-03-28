@@ -214,6 +214,9 @@ pub struct MiniSearch {
     stored_fields: HashMap<u32, HashMap<String, String>>,
     next_id: u32,
     dirt_count: u32,
+    /// Reverse index: doc short_id → set of terms it contributed.
+    /// Enables O(terms_in_doc) removal instead of O(all_terms).
+    doc_terms: HashMap<u32, HashSet<String>>,
 }
 
 impl MiniSearch {
@@ -238,6 +241,7 @@ impl MiniSearch {
             stored_fields: HashMap::new(),
             next_id: 0,
             dirt_count: 0,
+            doc_terms: HashMap::new(),
         }
     }
 
@@ -336,7 +340,9 @@ impl MiniSearch {
 
                 doc_field_lengths[field_id as usize] = term_counts.len() as u32;
 
+                let doc_term_set = self.doc_terms.entry(short_id).or_default();
                 for (term, freq) in term_counts {
+                    doc_term_set.insert(term.clone());
                     let term_data = self.index.get_or_create(&term);
                     term_data
                         .entry(field_id)
@@ -378,13 +384,42 @@ impl MiniSearch {
         self.index.len()
     }
 
-    /// Discard a document (lazy removal).
+    /// Discard a document. Uses the reverse index to clean up only the
+    /// terms this document contributed, so cost is O(terms_in_doc) not O(all_terms).
     pub fn discard(&mut self, id: &str) {
         if let Some(short_id) = self.id_to_short.remove(id) {
             self.document_ids.remove(&short_id);
             self.field_lengths.remove(&short_id);
             self.stored_fields.remove(&short_id);
-            self.dirt_count += 1;
+
+            // Clean up term index using reverse index
+            if let Some(terms) = self.doc_terms.remove(&short_id) {
+                let terms_vec: Vec<String> = terms.into_iter().collect();
+                for term in &terms_vec {
+                    let is_empty = if let Some(term_data) = self.index.get_mut(term) {
+                        // Remove this doc from all field entries
+                        let field_ids: Vec<u32> = term_data.keys().copied().collect();
+                        for fid in field_ids {
+                            if let Some(doc_freqs) = term_data.get_mut(&fid) {
+                                doc_freqs.remove(&short_id);
+                                if doc_freqs.is_empty() {
+                                    term_data.remove(&fid);
+                                }
+                            }
+                        }
+                        term_data.is_empty()
+                    } else {
+                        false
+                    };
+                    if is_empty {
+                        self.index.remove(term);
+                    }
+                }
+            } else {
+                // No reverse index (legacy) — fall back to dirt tracking
+                self.dirt_count += 1;
+            }
+
             self.update_avg_field_lengths();
         }
     }
@@ -396,53 +431,9 @@ impl MiniSearch {
         }
     }
 
-    /// Remove a document immediately (not lazy).
+    /// Remove a document immediately. Now uses the reverse index via discard().
     pub fn remove<D: Document>(&mut self, doc: D) {
-        let doc_id = doc.id().to_string();
-        if let Some(short_id) = self.id_to_short.remove(&doc_id) {
-            // Remove from document tracking
-            self.document_ids.remove(&short_id);
-            self.stored_fields.remove(&short_id);
-
-            // Remove from index immediately
-            let mut empty_terms: Vec<String> = Vec::new();
-
-            for (term, term_data) in self.index.iter() {
-                let mut has_doc = false;
-                for (_, doc_freqs) in term_data.iter() {
-                    if doc_freqs.contains_key(&short_id) {
-                        has_doc = true;
-                        break;
-                    }
-                }
-                if has_doc {
-                    // Check if this term only has this doc
-                    let mut only_this_doc = true;
-                    for (_, doc_freqs) in term_data.iter() {
-                        for (did, _) in doc_freqs.iter() {
-                            if *did != short_id && self.document_ids.contains_key(did) {
-                                only_this_doc = false;
-                                break;
-                            }
-                        }
-                        if !only_this_doc {
-                            break;
-                        }
-                    }
-                    if only_this_doc {
-                        empty_terms.push(term.clone());
-                    }
-                }
-            }
-
-            for term in empty_terms {
-                self.index.remove(&term);
-            }
-
-            self.field_lengths.remove(&short_id);
-            self.update_avg_field_lengths();
-            // No dirt_count increment - we cleaned immediately
-        }
+        self.discard(doc.id());
     }
 
     /// Replace a document (discard old, add new).
